@@ -1,0 +1,405 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: SIS 3 - orders system (API on Fargate -> SNS -> SQS -> Lambda -> DynamoDB)
+
+Parameters:
+  Env:
+    Type: String
+    AllowedValues: [dev, prod]
+    Default: dev
+  ImageTag:
+    Type: String
+    Default: initial
+  DesiredCount:
+    Type: Number
+    Default: 0
+    MinValue: 0
+
+Mappings:
+  Sizing:
+    dev:  { Cpu: "256", Memory: "512" }
+    prod: { Cpu: "512", Memory: "1024" }
+
+Conditions:
+  IsProd: !Equals [!Ref Env, prod]
+
+Resources:
+  # ---------- Network (public subnets, no NAT gateway) ----------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  Igw:
+    Type: AWS::EC2::InternetGateway
+
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref Igw
+
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
+
+  RouteA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetA
+      RouteTableId: !Ref RouteTable
+
+  RouteB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetB
+      RouteTableId: !Ref RouteTable
+
+  AlbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: public ALB
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  TaskSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Fargate tasks, only from the ALB
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref AlbSG
+
+  # ---------- Messaging ----------
+  OrdersDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600        # 14 days
+
+  OrdersQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: !If [IsProd, 120, 60]   # >= 6 x function timeout (10 s)
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrdersDLQ.Arn
+        maxReceiveCount: 5
+
+  OrderEvents:
+    Type: AWS::SNS::Topic
+
+  QueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref OrdersQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: sns.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt OrdersQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref OrderEvents
+
+  Subscription:
+    Type: AWS::SNS::Subscription
+    DependsOn: QueuePolicy
+    Properties:
+      TopicArn: !Ref OrderEvents
+      Protocol: sqs
+      Endpoint: !GetAtt OrdersQueue.Arn
+      RawMessageDelivery: true
+
+  # ---------- Idempotent consumer ----------
+  ProcessedTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+
+  StatsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+
+  ConsumerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: consumer-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource: !GetAtt OrdersQueue.Arn
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:UpdateItem]
+                Resource:
+                  - !GetAtt ProcessedTable.Arn
+                  - !GetAtt StatsTable.Arn
+
+  ConsumerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Timeout: 10
+      Role: !GetAtt ConsumerRole.Arn
+      Environment:
+        Variables:
+          PROCESSED_TABLE: !Ref ProcessedTable
+          STATS_TABLE: !Ref StatsTable
+      Code:
+        ZipFile: |
+          import json, os
+          import boto3
+
+          ddb = boto3.client("dynamodb")
+          PROCESSED = os.environ["PROCESSED_TABLE"]
+          STATS = os.environ["STATS_TABLE"]
+
+          def is_duplicate(err):
+              reasons = err.response.get("CancellationReasons", [])
+              return any(r.get("Code") == "ConditionalCheckFailed" for r in reasons)
+
+          def lambda_handler(event, context):
+              failed = []
+              for r in event["Records"]:
+                  order_id = "unknown"
+                  try:
+                      order_id = json.loads(r["body"])["orderId"]
+                      ddb.transact_write_items(TransactItems=[
+                          {"Put": {"TableName": PROCESSED,
+                                   "Item": {"pk": {"S": order_id}},
+                                   "ConditionExpression": "attribute_not_exists(pk)"}},
+                          {"Update": {"TableName": STATS,
+                                      "Key": {"pk": {"S": "orders_count"}},
+                                      "UpdateExpression": "ADD #c :one",
+                                      "ExpressionAttributeNames": {"#c": "count"},
+                                      "ExpressionAttributeValues": {":one": {"N": "1"}}}},
+                      ])
+                      print("processed", order_id)
+                  except ddb.exceptions.TransactionCanceledException as e:
+                      if is_duplicate(e):
+                          print("duplicate, skipped", order_id)
+                      else:
+                          failed.append({"itemIdentifier": r["messageId"]})
+                  except Exception as e:
+                      print("error", r["messageId"], e)
+                      failed.append({"itemIdentifier": r["messageId"]})
+              return {"batchItemFailures": failed}
+
+  ConsumerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ConsumerFunction}"
+      RetentionInDays: 7
+
+  QueueTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt OrdersQueue.Arn
+      FunctionName: !Ref ConsumerFunction
+      BatchSize: 10
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      ScalingConfig:
+        MaximumConcurrency: 2
+
+  # ---------- Container ----------
+  Repo:
+    Type: AWS::ECR::Repository
+    Properties:
+      ImageTagMutability: IMMUTABLE
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"keep last 5 images",
+          "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":5},
+          "action":{"type":"expire"}}]}
+
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: publish-order-events
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref OrderEvents
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+
+  TaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !FindInMap [Sizing, !Ref Env, Cpu]
+      Memory: !FindInMap [Sizing, !Ref Env, Memory]
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: app
+          Image: !Sub "${Repo.RepositoryUri}:${ImageTag}"
+          Essential: true
+          StopTimeout: 30
+          PortMappings:
+            - ContainerPort: 8080
+          Environment:
+            - Name: TOPIC_ARN
+              Value: !Ref OrderEvents
+            - Name: AWS_DEFAULT_REGION
+              Value: !Ref AWS::Region
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AppLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: app
+
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: IgwAttach
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      Subnets: [!Ref SubnetA, !Ref SubnetB]
+      SecurityGroups: [!Ref AlbSG]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      VpcId: !Ref Vpc
+      HealthCheckPath: /health
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: Listener
+    Properties:
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      TaskDefinition: !Ref TaskDef
+      DesiredCount: !Ref DesiredCount
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref SubnetA, !Ref SubnetB]
+          SecurityGroups: [!Ref TaskSG]
+      LoadBalancers:
+        - ContainerName: app
+          ContainerPort: 8080
+          TargetGroupArn: !Ref TargetGroup
+
+Outputs:
+  AlbUrl:
+    Value: !Sub "http://${Alb.DNSName}"
+  RepoUri:
+    Value: !GetAtt Repo.RepositoryUri
+  TopicArn:
+    Value: !Ref OrderEvents
+  DlqUrl:
+    Value: !Ref OrdersDLQ
