@@ -13,6 +13,10 @@ Parameters:
     Type: Number
     Default: 0
     MinValue: 0
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: Optional e-mail for the DLQ alarm (confirm the subscription by hand). Empty = alarm without e-mail.
 
 Mappings:
   Sizing:
@@ -21,9 +25,13 @@ Mappings:
 
 Conditions:
   IsProd: !Equals [!Ref Env, prod]
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
 
 Resources:
-  # ---------- Network (public subnets, no NAT gateway) ----------
+  # ---------- Network ----------
+  # Public subnets (SubnetA/B) hold only the ALB and the NAT gateway.
+  # Fargate tasks live in private subnets and reach ECR/SNS/logs through ONE NAT gateway
+  # (cheaper than one per AZ; trade-off: outbound traffic depends on AZ A).
   Vpc:
     Type: AWS::EC2::VPC
     Properties:
@@ -79,6 +87,64 @@ Resources:
       SubnetId: !Ref SubnetB
       RouteTableId: !Ref RouteTable
 
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.12.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: IgwAttach
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref SubnetA
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateRouteA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateRouteB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  S3GatewayEndpoint:   # ECR image layers come from S3; the gateway endpoint is free
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Gateway
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      RouteTableIds: [!Ref PrivateRouteTable]
+
   AlbSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -106,14 +172,45 @@ Resources:
     Type: AWS::SQS::Queue
     Properties:
       MessageRetentionPeriod: 1209600        # 14 days
+      SqsManagedSseEnabled: true
 
   OrdersQueue:
     Type: AWS::SQS::Queue
     Properties:
       VisibilityTimeout: !If [IsProd, 120, 60]   # >= 6 x function timeout (10 s)
+      SqsManagedSseEnabled: true
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt OrdersDLQ.Arn
         maxReceiveCount: 5
+
+  # A DLQ nobody watches is a slower way to lose data: alarm on ANY message in it.
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+
+  AlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  DlqNotEmptyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Messages landed in the dead-letter queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt OrdersDLQ.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
 
   OrderEvents:
     Type: AWS::SNS::Topic
@@ -373,7 +470,7 @@ Resources:
 
   Service:
     Type: AWS::ECS::Service
-    DependsOn: Listener
+    DependsOn: [Listener, PrivateDefaultRoute]   # tasks need the NAT route to pull the image
     Properties:
       Cluster: !Ref Cluster
       LaunchType: FARGATE
@@ -386,8 +483,8 @@ Resources:
           Rollback: true
       NetworkConfiguration:
         AwsvpcConfiguration:
-          AssignPublicIp: ENABLED
-          Subnets: [!Ref SubnetA, !Ref SubnetB]
+          AssignPublicIp: DISABLED
+          Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
           SecurityGroups: [!Ref TaskSG]
       LoadBalancers:
         - ContainerName: app
@@ -403,3 +500,11 @@ Outputs:
     Value: !Ref OrderEvents
   DlqUrl:
     Value: !Ref OrdersDLQ
+  QueueUrl:
+    Value: !Ref OrdersQueue
+  AppLogGroupName:
+    Value: !Ref AppLogGroup
+  ConsumerLogGroupName:
+    Value: !Ref ConsumerLogGroup
+  DlqAlarmName:
+    Value: !Ref DlqNotEmptyAlarm
