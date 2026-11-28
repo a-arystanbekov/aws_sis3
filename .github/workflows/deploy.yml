@@ -1,0 +1,94 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: orders-dev
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Lint the CloudFormation template
+        run: |
+          pip install cfn-lint
+          cfn-lint template.yaml
+      - name: Check the application code compiles
+        run: python -m py_compile app/app.py
+
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show OIDC subject (debug)
+        run: |
+          TOKEN=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | python3 -c "import sys,json;print(json.load(sys.stdin)['value'])")
+          echo "$TOKEN" | python3 -c "import sys,json,base64; p=sys.stdin.read().strip().split('.')[1]; p+='='*(-len(p)%4); print('sub =', json.loads(base64.urlsafe_b64decode(p))['sub'])"
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create the stack on the first run (0 tasks, no image yet)
+        run: |
+          if ! aws cloudformation describe-stacks --stack-name "$STACK_NAME" >/dev/null 2>&1; then
+            aws cloudformation deploy --stack-name "$STACK_NAME" --template-file template.yaml \
+              --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset \
+              --parameter-overrides Env=dev DesiredCount=0 ImageTag=initial
+          fi
+
+      - name: Build and push the image (tag = commit SHA)
+        run: |
+          REPO=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].Outputs[?OutputKey=='RepoUri'].OutputValue" --output text)
+          aws ecr get-login-password | docker login --username AWS --password-stdin "${REPO%%/*}"
+          if aws ecr describe-images --repository-name "${REPO#*/}" --image-ids imageTag=$GITHUB_SHA >/dev/null 2>&1; then
+            echo "Image $GITHUB_SHA already exists, skipping the build"
+          else
+            docker build -t "$REPO:$GITHUB_SHA" app/
+            docker push "$REPO:$GITHUB_SHA"
+          fi
+
+      - name: Deploy the stack with the new image tag
+        run: |
+          aws cloudformation deploy --stack-name "$STACK_NAME" --template-file template.yaml \
+            --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset \
+            --parameter-overrides Env=dev DesiredCount=2 ImageTag=$GITHUB_SHA
+
+      - name: Smoke test through the ALB
+        run: |
+          URL=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].Outputs[?OutputKey=='AlbUrl'].OutputValue" --output text)
+          for i in $(seq 1 20); do
+            if curl -fsS "$URL/health"; then echo; break; fi
+            echo "waiting for the service ($i)"; sleep 15
+          done
+          curl -fsS "$URL/health"
+          curl -fsS -X POST "$URL/orders" -d "{\"orderId\":\"ci-$GITHUB_RUN_ID\",\"total\":1}"
+
+      - name: Show which commit is running
+        run: |
+          CL=$(aws ecs list-clusters --query "clusterArns[?contains(@,'$STACK_NAME')]|[0]" --output text)
+          SVC=$(aws ecs list-services --cluster "$CL" --query "serviceArns[0]" --output text)
+          TD=$(aws ecs describe-services --cluster "$CL" --services "$SVC" --query "services[0].taskDefinition" --output text)
+          echo "Task definition: $TD"
+          aws ecs describe-task-definition --task-definition "$TD" --query "taskDefinition.containerDefinitions[0].image" --output text
+          echo "Commit: $GITHUB_SHA"
