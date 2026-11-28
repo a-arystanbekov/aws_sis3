@@ -27,3 +27,4 @@ It prints the service URL.
 - Logs: CloudWatch, 7-day retention.
 - No hard-coded resource names, so a second copy can be deployed under a new stack name.
 - Tasks run in public subnets (no NAT gateway) to avoid cost; production would use private subnets with NAT or VPC endpoints.
+Deployed by GitHub Actions
